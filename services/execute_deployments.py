@@ -177,6 +177,11 @@ async def execute_one(
     try:
         async with httpx.AsyncClient() as http:
             # delete first — makes writes idempotent
+            logger.info("Attempting HA push", extra={
+                "ha_url": ha_url,
+                "automation_key": automation_key,
+                "retry_count": retry_count,
+            })
             await http.delete(
                 f"{ha_url.rstrip('/')}/api/config/automation/config/{automation_key}",
                 headers={
