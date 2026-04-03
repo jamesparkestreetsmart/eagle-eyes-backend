@@ -275,6 +275,7 @@ async def execute_deployments(
             pending = await fetch_pending_deployments(pool)
 
             if not pending:
+                logger.info("Deployment sweep: 0 pending — nothing to do")
                 return
 
             logger.info(f"Deployment sweep: {len(pending)} pending")
