@@ -263,33 +263,21 @@ async def execute_deployments(
     alert_service: AlertService,
     max_concurrent: int = 5,
 ) -> None:
-    async with pool.acquire() as conn:
-        locked = await conn.fetchval(
-            "SELECT pg_try_advisory_lock(99999)"
-        )
-        if not locked:
-            logger.debug("Deployment sweep skipped — another worker holds the lock")
-            return
+    pending = await fetch_pending_deployments(pool)
 
-        try:
-            pending = await fetch_pending_deployments(pool)
+    if not pending:
+        logger.info("Deployment sweep: 0 pending — nothing to do")
+        return
 
-            if not pending:
-                logger.info("Deployment sweep: 0 pending — nothing to do")
-                return
+    logger.info(f"Deployment sweep: {len(pending)} pending")
 
-            logger.info(f"Deployment sweep: {len(pending)} pending")
+    semaphore = asyncio.Semaphore(max_concurrent)
 
-            semaphore = asyncio.Semaphore(max_concurrent)
+    async def bounded(record):
+        async with semaphore:
+            await execute_one(record, pool, alert_service)
 
-            async def bounded(record):
-                async with semaphore:
-                    await execute_one(record, pool, alert_service)
-
-            await asyncio.gather(
-                *[bounded(r) for r in pending],
-                return_exceptions=True,
-            )
-
-        finally:
-            await conn.execute("SELECT pg_advisory_unlock(99999)")
+    await asyncio.gather(
+        *[bounded(r) for r in pending],
+        return_exceptions=True,
+    )
