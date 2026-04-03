@@ -22,7 +22,11 @@ def configure_logging(level: str) -> None:
 
 def _allowed_origins(environment: str) -> list[str]:
     if environment == "production":
-        return ["https://your-ops-dashboard.example.com"]
+        return [
+            "https://streetsmartbuildings.com",
+            "https://www.streetsmartbuildings.com",
+            "https://eagle-eyes-dashboard.vercel.app",
+        ]
     if environment == "staging":
         return ["https://staging-dashboard.example.com"]
     return ["http://localhost:3000", "http://localhost:8080"]
@@ -51,7 +55,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Eagle Eyes Backend",
         version="1.0.0",
-        docs_url="/docs" if settings.environment != "production" else None,
+        docs_url="/docs",  # enabled in all environments for now
         redoc_url=None,
         lifespan=lifespan,
     )
@@ -59,7 +63,7 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_allowed_origins(settings.environment),
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -67,12 +71,12 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
-        """Kubernetes liveness probe."""
+        """Liveness probe."""
         return {"status": "ok"}
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz():
-        """Kubernetes readiness probe — verifies DB pool is live."""
+        """Readiness probe — verifies DB pool is live."""
         from dependencies import get_pool
         pool = await get_pool()
         await pool.fetchval("SELECT 1")
