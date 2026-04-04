@@ -65,6 +65,7 @@ async def mark_acknowledged(
     pool: asyncpg.Pool,
     deployment_id: uuid.UUID,
     entity_id: Optional[str],
+    installed_checksum: Optional[str] = None,  # ADD THIS LINE
 ) -> None:
     await pool.execute(
         """
@@ -80,7 +81,7 @@ async def mark_acknowledged(
             updated_at          = now()
         WHERE deployment_id = $1
         """,
-        deployment_id, entity_id,
+        deployment_id, entity_id, installed_checksum,  # ADD installed_checksum here
     )
 
 
@@ -217,6 +218,7 @@ async def execute_one(
                 await mark_acknowledged(
                     pool, deployment_id,
                     outcome.matched.entity_id if outcome.matched else None,
+                    installed_checksum=record["desired_checksum"], # ADD THIS LINE
                 )
                 logger.info("Deployment acknowledged", extra={
                     "correlation_id": get_correlation_id(),
