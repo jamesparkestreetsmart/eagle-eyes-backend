@@ -31,41 +31,73 @@ def _now() -> datetime:
 
 
 async def fetch_pending_deployments(pool: asyncpg.Pool) -> list[asyncpg.Record]:
-    return await pool.fetch(
-        """
-        SELECT
-            d.deployment_id,
-            d.site_id,
-            d.automation_key,
-            d.desired_yaml,
-            d.desired_checksum,
-            d.retry_count,
-            d.max_retries,
-            d.next_retry_at,
-            d.last_status,
-            s.ha_url,
-            s.ha_token
-        FROM c_ha_automation_deployments d
-        JOIN a_sites s ON s.site_id = d.site_id
-        WHERE d.push_confirmed = false
-          AND d.render_blocked = false
-          AND d.render_validated = true
-          AND s.ha_url IS NOT NULL
-          AND s.ha_token IS NOT NULL
-          AND (
-              d.next_retry_at IS NULL
-              OR d.next_retry_at <= now()
-          )
-        ORDER BY d.next_retry_at ASC NULLS FIRST
-        """,
-    )
+    """
+    Claim eligible deployments atomically using SKIP LOCKED.
+
+    Pattern: lock rows → mark last_status='claimed' → commit → return for processing.
+    Locks are released before any HA network work begins — we never hold row locks
+    across external calls.
+
+    Two sweeps running concurrently will each claim a disjoint set of rows.
+    A row already marked 'claimed' by another sweep is skipped.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Lock eligible rows — skip any already locked by a concurrent sweep
+            locked = await conn.fetch(
+                """
+                SELECT
+                    d.deployment_id,
+                    d.site_id,
+                    d.automation_key,
+                    d.desired_yaml,
+                    d.desired_checksum,
+                    d.retry_count,
+                    d.max_retries,
+                    d.next_retry_at,
+                    d.last_status,
+                    s.ha_url,
+                    s.ha_token
+                FROM c_ha_automation_deployments d
+                JOIN a_sites s ON s.site_id = d.site_id
+                WHERE d.push_confirmed = false
+                  AND d.render_blocked = false
+                  AND d.render_validated = true
+                  AND d.last_status != 'claimed'
+                  AND s.ha_url IS NOT NULL
+                  AND s.ha_token IS NOT NULL
+                  AND (
+                      d.next_retry_at IS NULL
+                      OR d.next_retry_at <= now()
+                  )
+                ORDER BY d.next_retry_at ASC NULLS FIRST
+                FOR UPDATE OF d SKIP LOCKED
+                """
+            )
+
+            if not locked:
+                return []
+
+            # Mark claimed inside the same transaction — commit releases the locks
+            ids = [r["deployment_id"] for r in locked]
+            await conn.execute(
+                """
+                UPDATE c_ha_automation_deployments
+                SET last_status = 'claimed', updated_at = now()
+                WHERE deployment_id = ANY($1)
+                """,
+                ids,
+            )
+
+        # Transaction committed — locks released, rows marked claimed
+        return list(locked)
 
 
 async def mark_acknowledged(
     pool: asyncpg.Pool,
     deployment_id: uuid.UUID,
     entity_id: Optional[str],
-    installed_checksum: Optional[str] = None,  # ADD THIS LINE
+    installed_checksum: Optional[str] = None,
 ) -> None:
     await pool.execute(
         """
@@ -77,11 +109,12 @@ async def mark_acknowledged(
             last_success_at     = now(),
             last_pushed_at      = now(),
             ha_automation_ref   = COALESCE($2, ha_automation_ref),
+            installed_checksum  = COALESCE($3, desired_checksum),
             last_error          = null,
             updated_at          = now()
         WHERE deployment_id = $1
         """,
-        deployment_id, entity_id, installed_checksum,  # ADD installed_checksum here
+        deployment_id, entity_id, installed_checksum,
     )
 
 
@@ -96,27 +129,46 @@ async def mark_failed(
     exhausted       = new_retry_count >= (max_retries or 3)
     next_retry_at   = None
 
-    if not exhausted and new_retry_count <= len(RETRY_BACKOFF):
-        next_retry_at = _now() + RETRY_BACKOFF[retry_count]
+    if exhausted:
+        # Terminal — promote to permanent_failure, clear retry eligibility
+        await pool.execute(
+            """
+            UPDATE c_ha_automation_deployments SET
+                last_status     = 'permanent_failure',
+                drift_status    = 'failed',
+                last_error      = $2,
+                retry_count     = $3,
+                next_retry_at   = NULL,
+                last_pushed_at  = now(),
+                updated_at      = now()
+            WHERE deployment_id = $1
+            """,
+            deployment_id,
+            f"[PERMANENT] Retry limit reached ({new_retry_count}/{max_retries or 3}): {error}",
+            new_retry_count,
+        )
+    else:
+        if new_retry_count <= len(RETRY_BACKOFF):
+            next_retry_at = _now() + RETRY_BACKOFF[retry_count]
 
-    await pool.execute(
-        """
-        UPDATE c_ha_automation_deployments SET
-            last_status     = $1,
-            drift_status    = 'failed',
-            last_error      = $2,
-            retry_count     = $3,
-            next_retry_at   = $4,
-            last_pushed_at  = now(),
-            updated_at      = now()
-        WHERE deployment_id = $5
-        """,
-        'failed',
-        error,
-        new_retry_count,
-        next_retry_at,
-        deployment_id,
-    )
+        await pool.execute(
+            """
+            UPDATE c_ha_automation_deployments SET
+                last_status     = 'failed',
+                drift_status    = 'failed',
+                last_error      = $2,
+                retry_count     = $3,
+                next_retry_at   = $4,
+                last_pushed_at  = now(),
+                updated_at      = now()
+            WHERE deployment_id = $5
+            """,
+            'failed',
+            error,
+            new_retry_count,
+            next_retry_at,
+            deployment_id,
+        )
 
 
 async def mark_mismatch(
@@ -218,7 +270,7 @@ async def execute_one(
                 await mark_acknowledged(
                     pool, deployment_id,
                     outcome.matched.entity_id if outcome.matched else None,
-                    installed_checksum=record["desired_checksum"], # ADD THIS LINE
+                    installed_checksum=record["desired_checksum"],
                 )
                 logger.info("Deployment acknowledged", extra={
                     "correlation_id": get_correlation_id(),
@@ -260,11 +312,135 @@ async def execute_one(
         await client.aclose()
 
 
+STUCK_THRESHOLD_MINUTES = 10
+
+
+async def check_guardrails(
+    pool: asyncpg.Pool,
+    alert_service: AlertService,
+) -> None:
+    """
+    Fire OpsAlerts for two conditions:
+    1. Exhausted retries — retry_count >= max_retries and still failed/not confirmed.
+    2. Stuck deployments — in a transient state (pending/failed) for > STUCK_THRESHOLD_MINUTES.
+    """
+
+    # --- 1. Exhausted retries ---
+    exhausted = await pool.fetch(
+        """
+        SELECT deployment_id, site_id::text AS site_id, automation_key,
+               retry_count, max_retries, last_error, last_status
+        FROM c_ha_automation_deployments
+        WHERE push_confirmed = false
+          AND retry_count >= COALESCE(max_retries, 3)
+          AND drift_status = 'failed'
+          AND guardrail_alerted_exhausted IS NOT TRUE
+        """
+    )
+    for row in exhausted:
+        logger.error(
+            "GUARDRAIL: retry limit exhausted",
+            extra={
+                "deployment_id":  str(row["deployment_id"]),
+                "automation_key": row["automation_key"],
+                "site_id":        row["site_id"],
+                "retry_count":    row["retry_count"],
+                "max_retries":    row["max_retries"],
+                "last_error":     row["last_error"],
+            },
+        )
+        await alert_service.send(OpsAlert(
+            site_id=row["site_id"],
+            alias=row["automation_key"],
+            deployment_key=row["automation_key"],
+            record_id=str(row["deployment_id"]),
+            reason=f"Retry limit exhausted after {row['retry_count']} attempts",
+            failure_domain="unknown",
+            last_error=row["last_error"],
+        ))
+        # stamp so we don't re-alert on every sweep
+        await pool.execute(
+            """
+            UPDATE c_ha_automation_deployments
+            SET guardrail_alerted_exhausted = true, updated_at = now()
+            WHERE deployment_id = $1
+            """,
+            row["deployment_id"],
+        )
+
+    # --- 2a. Stuck in pending/failed — aged from updated_at ---
+    stuck_transient = await pool.fetch(
+        """
+        SELECT deployment_id, site_id::text AS site_id, automation_key,
+               drift_status, last_error,
+               EXTRACT(EPOCH FROM (now() - updated_at)) / 60 AS stuck_minutes
+        FROM c_ha_automation_deployments
+        WHERE push_confirmed = false
+          AND drift_status IN ('pending', 'failed')
+          AND last_status != 'permanent_failure'
+          AND updated_at < now() - ($1 * interval '1 minute')
+          AND guardrail_alerted_stuck IS NOT TRUE
+        """,
+        STUCK_THRESHOLD_MINUTES,
+    )
+
+    # --- 2b. Pushed but no ack — aged from last_pushed_at, not updated_at ---
+    # updated_at is unreliable here since the sweep stamps it on every claim.
+    # last_pushed_at is the authoritative "when did we last push to HA" timestamp.
+    stuck_pushed = await pool.fetch(
+        """
+        SELECT deployment_id, site_id::text AS site_id, automation_key,
+               drift_status, last_error,
+               EXTRACT(EPOCH FROM (now() - last_pushed_at)) / 60 AS stuck_minutes
+        FROM c_ha_automation_deployments
+        WHERE push_confirmed = false
+          AND last_status = 'pushed'
+          AND last_pushed_at IS NOT NULL
+          AND last_pushed_at < now() - ($1 * interval '1 minute')
+          AND guardrail_alerted_stuck IS NOT TRUE
+        """,
+        STUCK_THRESHOLD_MINUTES,
+    )
+
+    for row in list(stuck_transient) + list(stuck_pushed):
+        stuck_min = round(float(row["stuck_minutes"]), 1)
+        logger.error(
+            "GUARDRAIL: deployment stuck",
+            extra={
+                "deployment_id":  str(row["deployment_id"]),
+                "automation_key": row["automation_key"],
+                "site_id":        row["site_id"],
+                "drift_status":   row["drift_status"],
+                "stuck_minutes":  stuck_min,
+            },
+        )
+        await alert_service.send(OpsAlert(
+            site_id=row["site_id"],
+            alias=row["automation_key"],
+            deployment_key=row["automation_key"],
+            record_id=str(row["deployment_id"]),
+            reason=f"Deployment stuck in '{row['drift_status']}' for {stuck_min} minutes",
+            failure_domain="unknown",
+            last_error=row["last_error"],
+        ))
+        await pool.execute(
+            """
+            UPDATE c_ha_automation_deployments
+            SET guardrail_alerted_stuck = true, updated_at = now()
+            WHERE deployment_id = $1
+            """,
+            row["deployment_id"],
+        )
+
+
 async def execute_deployments(
     pool: asyncpg.Pool,
     alert_service: AlertService,
     max_concurrent: int = 5,
 ) -> None:
+    # guardrail checks run on every sweep regardless of pending count
+    await check_guardrails(pool, alert_service)
+
     pending = await fetch_pending_deployments(pool)
 
     if not pending:
