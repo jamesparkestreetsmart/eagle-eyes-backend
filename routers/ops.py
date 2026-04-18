@@ -243,6 +243,10 @@ class ModbusDiscoveryResult(BaseModel):
     devices_updated: int
     details: list[dict]
     template_probes: Optional[list[dict]] = None
+    discovery_mode: Optional[Literal["config_entries", "yaml_unknown"]] = None
+    entities_live: Optional[bool] = None
+    ip_confidence: Optional[Literal["high", "low", "none"]] = None
+    entity_states: Optional[dict] = None
 
 
 @router.post("/discover-modbus-devices", response_model=ModbusDiscoveryResult)
@@ -298,7 +302,37 @@ async def discover_modbus_devices(
                 probe_entry["error"] = f"request failed: {e}"
             template_probes.append(probe_entry)
 
-        # Step 1: Query HA config entries for Modbus integrations
+        # Step 1: Entity liveness — primary signal for YAML Modbus sites.
+        entity_ids = [
+            "sensor.water_heater_hot_temp",
+            "sensor.water_heater_hot_flow_rate",
+            "sensor.water_heater_hot_accumulated_volume",
+        ]
+        entity_states: dict = {}
+        for entity_id in entity_ids:
+            try:
+                state_resp = await client.get(f"{ha_url}/api/states/{entity_id}", headers=headers)
+                if state_resp.status_code == 200:
+                    state_data = state_resp.json()
+                    state_val = state_data.get("state")
+                    entity_states[entity_id] = {
+                        "state": state_val,
+                        "available": state_val not in (None, "unavailable", "unknown"),
+                    }
+                else:
+                    entity_states[entity_id] = {
+                        "state": None,
+                        "available": False,
+                        "error": f"HTTP {state_resp.status_code}",
+                    }
+            except Exception as e:
+                entity_states[entity_id] = {"state": None, "available": False, "error": str(e)}
+
+        entities_live = bool(entity_states) and all(
+            es.get("available") for es in entity_states.values()
+        )
+
+        # Step 2: Query HA config entries for Modbus integrations
         try:
             resp = await client.get(f"{ha_url}/api/config/config_entries/entry", headers=headers)
             resp.raise_for_status()
@@ -313,45 +347,51 @@ async def discover_modbus_devices(
         ]
 
         if not modbus_entries:
-            # Fallback: parse secrets.yaml for nq_mp8l_host (pre-integration sites)
-            fallback_ip = None
-            fallback_detail = None
-            try:
-                secrets_resp = await client.get(
-                    f"{ha_url}/api/config/config/secrets.yaml", headers=headers
-                )
-                if secrets_resp.status_code == 200:
-                    for line in secrets_resp.text.splitlines():
-                        s = line.strip()
-                        if s.startswith("nq_mp8l_host:"):
-                            value = s.split(":", 1)[1].strip().strip('"').strip("'")
-                            if value:
-                                fallback_ip = value
-                            break
-                    if not fallback_ip:
-                        fallback_detail = "secrets.yaml had no nq_mp8l_host entry"
-                else:
-                    fallback_detail = f"secrets.yaml fetch returned HTTP {secrets_resp.status_code}"
-            except Exception as e:
-                fallback_detail = f"secrets.yaml fetch failed: {e}"
+            # YAML-configured (or missing) Modbus — fall back to the DB IP and
+            # report entity liveness as the primary health signal.
+            db_device = await pool.fetchrow(
+                """SELECT device_id, ip_address FROM a_devices
+                   WHERE site_id = $1 AND device_type_code = 'NQM'
+                   LIMIT 1""",
+                site_id,
+            )
+            db_ip = db_device["ip_address"] if db_device else None
+            ip_confidence_val: Literal["low", "none"] = "low" if db_ip else "none"
 
-            if fallback_ip:
-                modbus_entries = [{
-                    "entry_id": "secrets_yaml_fallback",
-                    "data": {"host": fallback_ip, "port": 502},
-                }]
-                logger.info(
-                    f"[modbus-discovery] site={site_id} no config_entries; using secrets.yaml fallback host={fallback_ip}"
+            if db_device and not req.dry_run:
+                await pool.execute(
+                    """UPDATE a_devices
+                       SET ip_discovery_mode = 'yaml_unknown',
+                           last_discovery_at = now(),
+                           updated_at = now()
+                       WHERE device_id = $1""",
+                    db_device["device_id"],
                 )
-            else:
-                return ModbusDiscoveryResult(
-                    site_id=site_id, devices_found=0, devices_updated=0,
-                    details=[{
-                        "message": "No Modbus integrations found in HA",
-                        "fallback": fallback_detail or "secrets.yaml did not yield a host",
-                    }],
-                    template_probes=template_probes,
-                )
+
+            details.append({
+                "source": "db_fallback",
+                "discovery_mode": "yaml_unknown",
+                "db_ip": db_ip,
+                "ip_confidence": ip_confidence_val,
+                "entities_live": entities_live,
+                "message": (
+                    "No Modbus config_entries in HA — using DB IP fallback"
+                    if db_device else
+                    "No Modbus config_entries in HA and no NQM device in DB"
+                ),
+            })
+
+            return ModbusDiscoveryResult(
+                site_id=site_id,
+                devices_found=0,
+                devices_updated=0,
+                details=details,
+                template_probes=template_probes,
+                discovery_mode="yaml_unknown",
+                entities_live=entities_live,
+                ip_confidence=ip_confidence_val,
+                entity_states=entity_states,
+            )
 
         for entry in modbus_entries:
             entry_data = entry.get("data", {})
@@ -366,26 +406,6 @@ async def discover_modbus_devices(
             devices_found += 1
             logger.info(f"[modbus-discovery] site={site_id} found Modbus device at {discovered_ip}:{discovered_port}")
 
-            # Step 2: Check entity states (optional — for diagnostics)
-            entity_states = []
-            for entity_id in [
-                "sensor.water_heater_hot_temp",
-                "sensor.water_heater_hot_flow_rate",
-                "sensor.water_heater_hot_accumulated_volume",
-            ]:
-                try:
-                    state_resp = await client.get(f"{ha_url}/api/states/{entity_id}", headers=headers)
-                    if state_resp.status_code == 200:
-                        state_data = state_resp.json()
-                        entity_states.append({
-                            "entity_id": entity_id,
-                            "state": state_data.get("state"),
-                            "available": state_data.get("state") != "unavailable",
-                        })
-                except Exception:
-                    pass
-
-            # Step 3: Auto-update a_devices.ip_address for NQM devices
             existing = await pool.fetchrow(
                 """SELECT device_id, ip_address FROM a_devices
                    WHERE site_id = $1 AND device_type_code = 'NQM'
@@ -398,7 +418,12 @@ async def discover_modbus_devices(
                 if old_ip != discovered_ip:
                     if not req.dry_run:
                         await pool.execute(
-                            """UPDATE a_devices SET ip_address = $1, updated_at = now()
+                            """UPDATE a_devices
+                               SET ip_address = $1,
+                                   ip_confidence = 'high',
+                                   ip_discovery_mode = 'config_entries',
+                                   last_discovery_at = now(),
+                                   updated_at = now()
                                WHERE device_id = $2""",
                             discovered_ip, existing["device_id"],
                         )
@@ -421,7 +446,6 @@ async def discover_modbus_devices(
                         "old_ip": old_ip,
                         "new_ip": discovered_ip,
                         "port": discovered_port,
-                        "entity_states": entity_states,
                     })
                 else:
                     details.append({
@@ -429,7 +453,6 @@ async def discover_modbus_devices(
                         "status": "unchanged",
                         "ip": discovered_ip,
                         "port": discovered_port,
-                        "entity_states": entity_states,
                     })
             else:
                 details.append({
@@ -438,7 +461,6 @@ async def discover_modbus_devices(
                     "discovered_ip": discovered_ip,
                     "port": discovered_port,
                     "message": "No NQM device in a_devices for this site",
-                    "entity_states": entity_states,
                 })
 
     return ModbusDiscoveryResult(
@@ -447,6 +469,10 @@ async def discover_modbus_devices(
         devices_updated=devices_updated,
         details=details,
         template_probes=template_probes,
+        discovery_mode="config_entries",
+        entities_live=entities_live,
+        ip_confidence="high",
+        entity_states=entity_states,
     )
 
 
