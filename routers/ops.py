@@ -477,6 +477,83 @@ async def discover_modbus_devices(
 
 
 # ------------------------------------------------------------------
+# HA service-call proxy
+# ------------------------------------------------------------------
+
+class HaServiceRequest(BaseModel):
+    site_id: str
+    domain: str
+    service: str
+    service_data: Optional[dict] = None
+
+
+class HaServiceResult(BaseModel):
+    site_id: str
+    domain: str
+    service: str
+    status_code: int
+    ok: bool
+    result: Optional[list | dict] = None
+    error: Optional[str] = None
+
+
+@router.post("/ha-service", response_model=HaServiceResult)
+async def call_ha_service(
+    req: HaServiceRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """
+    Proxy an HA service call through the Render worker. Posts to
+    {ha_url}/api/services/{domain}/{service} with the provided service_data.
+    Examples:
+      {"site_id": "...", "domain": "homeassistant", "service": "reload_all"}
+      {"site_id": "...", "domain": "modbus", "service": "reload"}
+    """
+    row = await pool.fetchrow(
+        "SELECT ha_url, ha_token FROM a_sites WHERE site_id = $1", req.site_id
+    )
+    if not row or not row["ha_url"] or not row["ha_token"]:
+        raise HTTPException(status_code=400, detail="Site has no HA connection configured")
+
+    ha_url = row["ha_url"].rstrip("/")
+    ha_token = row["ha_token"]
+    headers = {"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"}
+    url = f"{ha_url}/api/services/{req.domain}/{req.service}"
+    payload = req.service_data or {}
+
+    logger.info(f"[ha-service] site={req.site_id} -> {req.domain}.{req.service}")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(url, headers=headers, json=payload)
+        except Exception as e:
+            logger.warning(f"[ha-service] call failed for site {req.site_id}: {e}")
+            raise HTTPException(status_code=502, detail=f"HA service call failed: {e}")
+
+    result: Optional[list | dict] = None
+    error: Optional[str] = None
+    ok = 200 <= resp.status_code < 300
+
+    if ok:
+        try:
+            result = resp.json()
+        except Exception:
+            result = None
+    else:
+        error = resp.text[:500]
+
+    return HaServiceResult(
+        site_id=req.site_id,
+        domain=req.domain,
+        service=req.service,
+        status_code=resp.status_code,
+        ok=ok,
+        result=result,
+        error=error,
+    )
+
+
+# ------------------------------------------------------------------
 # HA entity state diagnostics
 # ------------------------------------------------------------------
 
