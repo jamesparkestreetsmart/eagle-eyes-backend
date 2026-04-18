@@ -234,6 +234,7 @@ logger = logging.getLogger(__name__)
 
 class ModbusDiscoveryRequest(BaseModel):
     site_id: str
+    dry_run: bool = False
 
 
 class ModbusDiscoveryResult(BaseModel):
@@ -333,28 +334,28 @@ async def discover_modbus_devices(
             if existing:
                 old_ip = existing["ip_address"]
                 if old_ip != discovered_ip:
-                    await pool.execute(
-                        """UPDATE a_devices SET ip_address = $1, updated_at = now()
-                           WHERE device_id = $2""",
-                        discovered_ip, existing["device_id"],
-                    )
+                    if not req.dry_run:
+                        await pool.execute(
+                            """UPDATE a_devices SET ip_address = $1, updated_at = now()
+                               WHERE device_id = $2""",
+                            discovered_ip, existing["device_id"],
+                        )
+                        await pool.execute(
+                            """INSERT INTO b_records_log (site_id, event_type, source, message, created_by, event_date)
+                               VALUES ($1, 'modbus_ip_update', 'modbus_discovery',
+                                       $2, 'system', CURRENT_DATE)""",
+                            site_id,
+                            f"NQM IP auto-updated: {old_ip} -> {discovered_ip} (from HA Modbus config)",
+                        )
                     devices_updated += 1
                     logger.info(
-                        f"[modbus-discovery] site={site_id} NQM IP updated: {old_ip} -> {discovered_ip}"
-                    )
-
-                    # Log the change
-                    await pool.execute(
-                        """INSERT INTO b_records_log (site_id, event_type, source, message, created_by, event_date)
-                           VALUES ($1, 'modbus_ip_update', 'modbus_discovery',
-                                   $2, 'system', CURRENT_DATE)""",
-                        site_id,
-                        f"NQM IP auto-updated: {old_ip} -> {discovered_ip} (from HA Modbus config)",
+                        f"[modbus-discovery] site={site_id} NQM IP {'would update' if req.dry_run else 'updated'}: {old_ip} -> {discovered_ip}"
                     )
 
                     details.append({
                         "entry_id": entry_id,
-                        "status": "updated",
+                        "status": "would_update" if req.dry_run else "updated",
+                        "dry_run": req.dry_run,
                         "old_ip": old_ip,
                         "new_ip": discovered_ip,
                         "port": discovered_port,
