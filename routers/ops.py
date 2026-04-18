@@ -242,6 +242,7 @@ class ModbusDiscoveryResult(BaseModel):
     devices_found: int
     devices_updated: int
     details: list[dict]
+    template_probes: Optional[list[dict]] = None
 
 
 @router.post("/discover-modbus-devices", response_model=ModbusDiscoveryResult)
@@ -270,7 +271,33 @@ async def discover_modbus_devices(
     devices_found = 0
     devices_updated = 0
 
+    template_probes: list[dict] = []
+
     async with httpx.AsyncClient(timeout=10.0) as client:
+        # Step 0: Live template probes — tells us whether the sensor is alive,
+        # unavailable, or zero, regardless of whether we can discover the IP.
+        probe_templates = [
+            ("hot_flow_rate_state", "{{ states('sensor.water_heater_hot_flow_rate') }}"),
+            ("hot_flow_rate_friendly_name",
+             "{{ state_attr('sensor.water_heater_hot_flow_rate', 'friendly_name') }}"),
+        ]
+        for probe_name, tmpl in probe_templates:
+            probe_entry: dict = {"name": probe_name, "template": tmpl}
+            try:
+                probe_resp = await client.post(
+                    f"{ha_url}/api/template",
+                    headers=headers,
+                    json={"template": tmpl},
+                )
+                probe_entry["status_code"] = probe_resp.status_code
+                if probe_resp.status_code == 200:
+                    probe_entry["result"] = probe_resp.text
+                else:
+                    probe_entry["error"] = probe_resp.text[:300]
+            except Exception as e:
+                probe_entry["error"] = f"request failed: {e}"
+            template_probes.append(probe_entry)
+
         # Step 1: Query HA config entries for Modbus integrations
         try:
             resp = await client.get(f"{ha_url}/api/config/config_entries/entry", headers=headers)
@@ -323,6 +350,7 @@ async def discover_modbus_devices(
                         "message": "No Modbus integrations found in HA",
                         "fallback": fallback_detail or "secrets.yaml did not yield a host",
                     }],
+                    template_probes=template_probes,
                 )
 
         for entry in modbus_entries:
@@ -418,6 +446,7 @@ async def discover_modbus_devices(
         devices_found=devices_found,
         devices_updated=devices_updated,
         details=details,
+        template_probes=template_probes,
     )
 
 
