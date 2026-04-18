@@ -385,3 +385,108 @@ async def discover_modbus_devices(
         devices_updated=devices_updated,
         details=details,
     )
+
+
+# ------------------------------------------------------------------
+# HA entity state diagnostics
+# ------------------------------------------------------------------
+
+class HAEntityState(BaseModel):
+    entity_id:      str
+    found:          bool
+    state:          Optional[str] = None
+    last_changed:   Optional[str] = None
+    last_updated:   Optional[str] = None
+    attributes:     Optional[dict] = None
+    error:          Optional[str] = None
+    status_code:    Optional[int] = None
+
+
+class HAEntityStatesRequest(BaseModel):
+    site_id:    str
+    entity_ids: list[str]
+
+
+class HAEntityStatesResponse(BaseModel):
+    site_id:  str
+    ha_url:   str
+    count:    int
+    states:   list[HAEntityState]
+
+
+async def _fetch_ha_credentials(pool: asyncpg.Pool, site_id: str) -> tuple[str, str]:
+    row = await pool.fetchrow(
+        "SELECT ha_url, ha_token FROM a_sites WHERE site_id = $1", site_id
+    )
+    if not row or not row["ha_url"] or not row["ha_token"]:
+        raise HTTPException(status_code=400, detail="Site has no HA connection configured")
+    return row["ha_url"].rstrip("/"), row["ha_token"]
+
+
+async def _fetch_ha_entity_state(
+    client: httpx.AsyncClient, ha_url: str, headers: dict, entity_id: str
+) -> HAEntityState:
+    try:
+        resp = await client.get(f"{ha_url}/api/states/{entity_id}", headers=headers)
+    except httpx.HTTPError as e:
+        return HAEntityState(entity_id=entity_id, found=False, error=str(e))
+
+    if resp.status_code == 404:
+        return HAEntityState(entity_id=entity_id, found=False, status_code=404)
+    if resp.status_code != 200:
+        return HAEntityState(
+            entity_id=entity_id,
+            found=False,
+            status_code=resp.status_code,
+            error=resp.text[:500],
+        )
+
+    data = resp.json()
+    return HAEntityState(
+        entity_id=entity_id,
+        found=True,
+        state=data.get("state"),
+        last_changed=data.get("last_changed"),
+        last_updated=data.get("last_updated"),
+        attributes=data.get("attributes"),
+        status_code=200,
+    )
+
+
+@router.get("/ha-entity-state", response_model=HAEntityState)
+async def ha_entity_state(
+    site_id:   str = Query(..., description="Site UUID"),
+    entity_id: str = Query(..., description="HA entity_id, e.g. sensor.foo_bar"),
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """Fetch the current HA state for a single entity at a site."""
+    ha_url, ha_token = await _fetch_ha_credentials(pool, site_id)
+    headers = {"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        return await _fetch_ha_entity_state(client, ha_url, headers, entity_id)
+
+
+@router.post("/ha-entity-states", response_model=HAEntityStatesResponse)
+async def ha_entity_states(
+    req: HAEntityStatesRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """Fetch current HA states for a batch of entities at a site."""
+    if not req.entity_ids:
+        raise HTTPException(status_code=400, detail="entity_ids must not be empty")
+
+    ha_url, ha_token = await _fetch_ha_credentials(pool, req.site_id)
+    headers = {"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        states = [
+            await _fetch_ha_entity_state(client, ha_url, headers, eid)
+            for eid in req.entity_ids
+        ]
+
+    return HAEntityStatesResponse(
+        site_id=req.site_id,
+        ha_url=ha_url,
+        count=len(states),
+        states=states,
+    )
