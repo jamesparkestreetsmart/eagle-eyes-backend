@@ -286,10 +286,44 @@ async def discover_modbus_devices(
         ]
 
         if not modbus_entries:
-            return ModbusDiscoveryResult(
-                site_id=site_id, devices_found=0, devices_updated=0,
-                details=[{"message": "No Modbus integrations found in HA"}],
-            )
+            # Fallback: parse secrets.yaml for nq_mp8l_host (pre-integration sites)
+            fallback_ip = None
+            fallback_detail = None
+            try:
+                secrets_resp = await client.get(
+                    f"{ha_url}/api/config/config/secrets.yaml", headers=headers
+                )
+                if secrets_resp.status_code == 200:
+                    for line in secrets_resp.text.splitlines():
+                        s = line.strip()
+                        if s.startswith("nq_mp8l_host:"):
+                            value = s.split(":", 1)[1].strip().strip('"').strip("'")
+                            if value:
+                                fallback_ip = value
+                            break
+                    if not fallback_ip:
+                        fallback_detail = "secrets.yaml had no nq_mp8l_host entry"
+                else:
+                    fallback_detail = f"secrets.yaml fetch returned HTTP {secrets_resp.status_code}"
+            except Exception as e:
+                fallback_detail = f"secrets.yaml fetch failed: {e}"
+
+            if fallback_ip:
+                modbus_entries = [{
+                    "entry_id": "secrets_yaml_fallback",
+                    "data": {"host": fallback_ip, "port": 502},
+                }]
+                logger.info(
+                    f"[modbus-discovery] site={site_id} no config_entries; using secrets.yaml fallback host={fallback_ip}"
+                )
+            else:
+                return ModbusDiscoveryResult(
+                    site_id=site_id, devices_found=0, devices_updated=0,
+                    details=[{
+                        "message": "No Modbus integrations found in HA",
+                        "fallback": fallback_detail or "secrets.yaml did not yield a host",
+                    }],
+                )
 
         for entry in modbus_entries:
             entry_data = entry.get("data", {})
