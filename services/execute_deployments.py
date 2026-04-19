@@ -62,6 +62,7 @@ async def fetch_pending_deployments(pool: asyncpg.Pool) -> list[asyncpg.Record]:
                     d.last_status,
                     s.ha_url,
                     s.ha_token,
+                    s.ha_supervisor_token,
                     COALESCE(t.block_type, 'automation') AS block_type,
                     t.destination_path                   AS destination_path
                 FROM c_ha_automation_deployments d
@@ -214,16 +215,29 @@ _FILE_EDITOR_SLUG_CANDIDATES = (
 )
 
 
+SUPERVISOR_AUTH_HELP = (
+    "Supervisor access requires ha_supervisor_token minted from an admin user. "
+    "Go to HA profile → Security → Long-lived access tokens, create a token as admin, "
+    "then update a_sites.ha_supervisor_token for this site."
+)
+
+
 async def _discover_file_editor_slug(
-    http: httpx.AsyncClient, ha_url: str, ha_token: str
+    http: httpx.AsyncClient,
+    ha_url: str,
+    supervisor_token: str,
+    has_supervisor_token: bool,
 ) -> Optional[str]:
     """Return a started File Editor-like add-on slug, or None if none found."""
     resp = await http.get(
         f"{ha_url.rstrip('/')}/api/hassio/addons",
-        headers={"Authorization": f"Bearer {ha_token}"},
+        headers={"Authorization": f"Bearer {supervisor_token}"},
         timeout=10,
     )
+    if resp.status_code == 401 and not has_supervisor_token:
+        raise RuntimeError(SUPERVISOR_AUTH_HELP)
     resp.raise_for_status()
+
     body = resp.json() or {}
     payload = body.get("data", body) if isinstance(body, dict) else {}
     addons = payload.get("addons", []) if isinstance(payload, dict) else []
@@ -251,6 +265,8 @@ async def _push_yaml_file_via_file_editor(
     http: httpx.AsyncClient,
     ha_url: str,
     ha_token: str,
+    supervisor_token: str,
+    has_supervisor_token: bool,
     destination_path: str,
     yaml_content: str,
 ) -> None:
@@ -258,10 +274,15 @@ async def _push_yaml_file_via_file_editor(
     Write `yaml_content` to `destination_path` on the HA config volume via the
     File Editor add-on ingress, then call homeassistant.reload_all.
 
-    Raises httpx.HTTPError on any failure — caller is expected to translate to
-    deployment failure state.
+    Uses supervisor_token for `/api/hassio/*` (Supervisor proxy) and ha_token
+    for `/api/services/homeassistant/reload_all` (core REST API).
+
+    Raises on any failure — caller is expected to translate to deployment
+    failure state.
     """
-    slug = await _discover_file_editor_slug(http, ha_url, ha_token)
+    slug = await _discover_file_editor_slug(
+        http, ha_url, supervisor_token, has_supervisor_token,
+    )
     if not slug:
         raise RuntimeError(
             "No File Editor-compatible add-on found on HA "
@@ -272,12 +293,14 @@ async def _push_yaml_file_via_file_editor(
     resp = await http.post(
         write_url,
         headers={
-            "Authorization": f"Bearer {ha_token}",
+            "Authorization": f"Bearer {supervisor_token}",
             "Content-Type": "application/json",
         },
         json={"path": destination_path, "content": yaml_content},
         timeout=25,
     )
+    if resp.status_code == 401 and not has_supervisor_token:
+        raise RuntimeError(SUPERVISOR_AUTH_HELP)
     resp.raise_for_status()
 
     reload_url = f"{ha_url.rstrip('/')}/api/services/homeassistant/reload_all"
@@ -298,16 +321,17 @@ async def execute_one(
     pool: asyncpg.Pool,
     alert_service: AlertService,
 ) -> None:
-    cid              = set_correlation_id()
-    deployment_id    = record["deployment_id"]
-    site_id          = record["site_id"]
-    automation_key   = record["automation_key"]
-    ha_url           = record["ha_url"]
-    ha_token         = record["ha_token"]
-    retry_count      = record["retry_count"] or 0
-    max_retries      = record["max_retries"] or 3
-    block_type       = (record["block_type"] or "automation").lower()
-    destination_path = record["destination_path"]
+    cid                  = set_correlation_id()
+    deployment_id        = record["deployment_id"]
+    site_id              = record["site_id"]
+    automation_key       = record["automation_key"]
+    ha_url               = record["ha_url"]
+    ha_token             = record["ha_token"]
+    ha_supervisor_token  = record["ha_supervisor_token"]
+    retry_count          = record["retry_count"] or 0
+    max_retries          = record["max_retries"] or 3
+    block_type           = (record["block_type"] or "automation").lower()
+    destination_path     = record["destination_path"]
 
     logger.info("Executing deployment", extra={
         "correlation_id": cid,
@@ -339,6 +363,9 @@ async def execute_one(
             )
             return
 
+        supervisor_token     = ha_supervisor_token or ha_token
+        has_supervisor_token = bool(ha_supervisor_token)
+
         try:
             async with httpx.AsyncClient() as http:
                 logger.info("Attempting HA file-editor push", extra={
@@ -347,9 +374,12 @@ async def execute_one(
                     "block_type": block_type,
                     "destination_path": destination_path,
                     "retry_count": retry_count,
+                    "supervisor_token_source": "ha_supervisor_token" if has_supervisor_token else "ha_token_fallback",
                 })
                 await _push_yaml_file_via_file_editor(
-                    http, ha_url, ha_token, destination_path, yaml_content,
+                    http, ha_url, ha_token,
+                    supervisor_token, has_supervisor_token,
+                    destination_path, yaml_content,
                 )
 
             await mark_acknowledged(

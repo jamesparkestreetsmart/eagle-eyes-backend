@@ -597,18 +597,28 @@ async def list_ha_addons(
     Proxy GET {ha_url}/api/hassio/addons. Returns the list of installed add-ons
     plus any slugs that match the File Editor discovery heuristic used by the
     deployment executor's file-write path.
+
+    Uses ha_supervisor_token if set (required for /api/hassio/* proxy), falling
+    back to ha_token. Returns a clear instructional error on 401 with no
+    supervisor token configured.
     """
     row = await pool.fetchrow(
-        "SELECT ha_url, ha_token FROM a_sites WHERE site_id = $1", site_id
+        """SELECT ha_url, ha_token, ha_supervisor_token
+             FROM a_sites WHERE site_id = $1""",
+        site_id,
     )
     if not row or not row["ha_url"] or not row["ha_token"]:
         raise HTTPException(status_code=400, detail="Site has no HA connection configured")
 
     ha_url = row["ha_url"].rstrip("/")
-    ha_token = row["ha_token"]
-    headers = {"Authorization": f"Bearer {ha_token}"}
+    supervisor_token = row["ha_supervisor_token"] or row["ha_token"]
+    has_supervisor_token = bool(row["ha_supervisor_token"])
+    headers = {"Authorization": f"Bearer {supervisor_token}"}
 
-    logger.info(f"[ha-addons] site={site_id} listing addons")
+    logger.info(
+        f"[ha-addons] site={site_id} listing addons "
+        f"(supervisor_token={'present' if has_supervisor_token else 'fallback:ha_token'})"
+    )
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -623,7 +633,14 @@ async def list_ha_addons(
     error: Optional[str] = None
 
     if not ok:
-        error = resp.text[:500]
+        if resp.status_code == 401 and not has_supervisor_token:
+            error = (
+                "Supervisor access requires ha_supervisor_token minted from an admin user. "
+                "Go to HA profile → Security → Long-lived access tokens, create a token as admin, "
+                "then update a_sites.ha_supervisor_token for this site."
+            )
+        else:
+            error = resp.text[:500]
         return HaAddonsResult(
             site_id=site_id, status_code=resp.status_code, ok=False,
             count=0, addons=[], file_editor_candidates=[], error=error,
