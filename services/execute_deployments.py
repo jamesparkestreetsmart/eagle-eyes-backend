@@ -40,6 +40,10 @@ async def fetch_pending_deployments(pool: asyncpg.Pool) -> list[asyncpg.Record]:
 
     Two sweeps running concurrently will each claim a disjoint set of rows.
     A row already marked 'claimed' by another sweep is skipped.
+
+    Joins c_ha_templates via resolved_template_id to pick up block_type and
+    destination_path so the executor can route between the automation REST API
+    and the File Editor add-on file-write path.
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -57,9 +61,13 @@ async def fetch_pending_deployments(pool: asyncpg.Pool) -> list[asyncpg.Record]:
                     d.next_retry_at,
                     d.last_status,
                     s.ha_url,
-                    s.ha_token
+                    s.ha_token,
+                    COALESCE(t.block_type, 'automation') AS block_type,
+                    t.destination_path                   AS destination_path
                 FROM c_ha_automation_deployments d
                 JOIN a_sites s ON s.site_id = d.site_id
+                LEFT JOIN c_ha_templates t
+                       ON t.automation_template_id = d.resolved_template_id
                 WHERE d.push_confirmed = false
                   AND d.render_blocked = false
                   AND d.render_validated = true
@@ -189,19 +197,117 @@ async def mark_mismatch(
     )
 
 
+# Block types that deploy as yaml files in packages/ via the File Editor add-on,
+# followed by a `homeassistant.reload_all`. Everything else goes through the
+# automation REST API path.
+FILE_WRITE_BLOCK_TYPES = {"modbus", "rest_command", "input_text", "input_helpers"}
+
+# File Editor add-on slug candidates, in priority order. The slug varies by
+# install (community "File editor" vs. deprecated "Configurator", etc.), so
+# we discover at call time against /api/hassio/addons.
+_FILE_EDITOR_SLUG_CANDIDATES = (
+    "core_configurator",
+    "a0d7b954_ssh",
+    "a0d7b954_filebrowser",
+    "65bca5d9_ssh",
+    "core_ssh",
+)
+
+
+async def _discover_file_editor_slug(
+    http: httpx.AsyncClient, ha_url: str, ha_token: str
+) -> Optional[str]:
+    """Return a started File Editor-like add-on slug, or None if none found."""
+    resp = await http.get(
+        f"{ha_url.rstrip('/')}/api/hassio/addons",
+        headers={"Authorization": f"Bearer {ha_token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    body = resp.json() or {}
+    payload = body.get("data", body) if isinstance(body, dict) else {}
+    addons = payload.get("addons", []) if isinstance(payload, dict) else []
+    if not isinstance(addons, list):
+        return None
+
+    by_slug = {a.get("slug"): a for a in addons if isinstance(a, dict) and a.get("slug")}
+    # Prefer known slugs that are started
+    for slug in _FILE_EDITOR_SLUG_CANDIDATES:
+        entry = by_slug.get(slug)
+        if entry and entry.get("state") == "started":
+            return slug
+
+    # Heuristic fallback: any started add-on whose name implies file editing
+    for entry in addons:
+        name = (entry.get("name") or "").lower() if isinstance(entry, dict) else ""
+        if entry.get("state") != "started":
+            continue
+        if any(k in name for k in ("file editor", "file browser", "configurator", "filebrowser")):
+            return entry.get("slug")
+    return None
+
+
+async def _push_yaml_file_via_file_editor(
+    http: httpx.AsyncClient,
+    ha_url: str,
+    ha_token: str,
+    destination_path: str,
+    yaml_content: str,
+) -> None:
+    """
+    Write `yaml_content` to `destination_path` on the HA config volume via the
+    File Editor add-on ingress, then call homeassistant.reload_all.
+
+    Raises httpx.HTTPError on any failure — caller is expected to translate to
+    deployment failure state.
+    """
+    slug = await _discover_file_editor_slug(http, ha_url, ha_token)
+    if not slug:
+        raise RuntimeError(
+            "No File Editor-compatible add-on found on HA "
+            "(tried core_configurator, a0d7b954_ssh, a0d7b954_filebrowser, heuristic match)"
+        )
+
+    write_url = f"{ha_url.rstrip('/')}/api/hassio/ingress/{slug}/files"
+    resp = await http.post(
+        write_url,
+        headers={
+            "Authorization": f"Bearer {ha_token}",
+            "Content-Type": "application/json",
+        },
+        json={"path": destination_path, "content": yaml_content},
+        timeout=25,
+    )
+    resp.raise_for_status()
+
+    reload_url = f"{ha_url.rstrip('/')}/api/services/homeassistant/reload_all"
+    reload_resp = await http.post(
+        reload_url,
+        headers={
+            "Authorization": f"Bearer {ha_token}",
+            "Content-Type": "application/json",
+        },
+        json={},
+        timeout=30,
+    )
+    reload_resp.raise_for_status()
+
+
 async def execute_one(
     record: asyncpg.Record,
     pool: asyncpg.Pool,
     alert_service: AlertService,
 ) -> None:
-    cid            = set_correlation_id()
-    deployment_id  = record["deployment_id"]
-    site_id        = record["site_id"]
-    automation_key = record["automation_key"]
-    ha_url         = record["ha_url"]
-    ha_token       = record["ha_token"]
-    retry_count    = record["retry_count"] or 0
-    max_retries    = record["max_retries"] or 3
+    cid              = set_correlation_id()
+    deployment_id    = record["deployment_id"]
+    site_id          = record["site_id"]
+    automation_key   = record["automation_key"]
+    ha_url           = record["ha_url"]
+    ha_token         = record["ha_token"]
+    retry_count      = record["retry_count"] or 0
+    max_retries      = record["max_retries"] or 3
+    block_type       = (record["block_type"] or "automation").lower()
+    destination_path = record["destination_path"]
 
     logger.info("Executing deployment", extra={
         "correlation_id": cid,
@@ -209,8 +315,65 @@ async def execute_one(
         "automation_key": automation_key,
         "site_id":        str(site_id),
         "retry_count":    retry_count,
+        "block_type":     block_type,
     })
 
+    # -----------------------------------------------------------------
+    # File-write path: modbus / rest_command / input_text / input_helpers
+    # YAML packages files written via the File Editor add-on, then reloaded.
+    # -----------------------------------------------------------------
+    if block_type in FILE_WRITE_BLOCK_TYPES:
+        yaml_content = record["desired_yaml"] or ""
+        if not destination_path:
+            await mark_failed(
+                pool, deployment_id,
+                f"Template block_type={block_type} missing destination_path",
+                retry_count, max_retries,
+            )
+            return
+        if not yaml_content.strip():
+            await mark_failed(
+                pool, deployment_id,
+                "desired_yaml is empty — refusing to write empty file",
+                retry_count, max_retries,
+            )
+            return
+
+        try:
+            async with httpx.AsyncClient() as http:
+                logger.info("Attempting HA file-editor push", extra={
+                    "ha_url": ha_url,
+                    "automation_key": automation_key,
+                    "block_type": block_type,
+                    "destination_path": destination_path,
+                    "retry_count": retry_count,
+                })
+                await _push_yaml_file_via_file_editor(
+                    http, ha_url, ha_token, destination_path, yaml_content,
+                )
+
+            await mark_acknowledged(
+                pool, deployment_id,
+                entity_id=None,
+                installed_checksum=record["desired_checksum"],
+            )
+            logger.info("File-editor deployment acknowledged", extra={
+                "correlation_id": get_correlation_id(),
+                "deployment_id":  str(deployment_id),
+                "automation_key": automation_key,
+                "destination_path": destination_path,
+            })
+        except Exception as e:
+            logger.exception("File-editor deployment failed", extra={
+                "correlation_id": get_correlation_id(),
+                "deployment_id":  str(deployment_id),
+            })
+            await mark_failed(pool, deployment_id, str(e), retry_count, max_retries)
+        return
+
+    # -----------------------------------------------------------------
+    # Automation path (default / legacy): POST to HA automation config API.
+    # -----------------------------------------------------------------
     try:
         payload = yaml.safe_load(record["desired_yaml"])
         alias   = payload.get("alias", "")
