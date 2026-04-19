@@ -554,6 +554,131 @@ async def call_ha_service(
 
 
 # ------------------------------------------------------------------
+# HA add-on diagnostics
+# ------------------------------------------------------------------
+
+class HaAddonEntry(BaseModel):
+    slug: Optional[str] = None
+    name: Optional[str] = None
+    state: Optional[str] = None
+    version: Optional[str] = None
+    installed: Optional[str] = None
+    update_available: Optional[bool] = None
+
+
+class HaAddonsResult(BaseModel):
+    site_id: str
+    status_code: int
+    ok: bool
+    count: int
+    addons: list[HaAddonEntry]
+    file_editor_candidates: list[str]
+    error: Optional[str] = None
+
+
+# Slugs the deployment executor looks for when routing file-write block types
+# (kept in sync with services/execute_deployments.py::_FILE_EDITOR_SLUG_CANDIDATES).
+_FILE_EDITOR_SLUGS = (
+    "core_configurator",
+    "a0d7b954_ssh",
+    "a0d7b954_filebrowser",
+    "65bca5d9_ssh",
+    "core_ssh",
+)
+_FILE_EDITOR_NAME_KEYWORDS = ("file editor", "file browser", "configurator", "filebrowser")
+
+
+@router.get("/ha-addons", response_model=HaAddonsResult)
+async def list_ha_addons(
+    site_id: str = Query(..., description="site_id whose HA install to query"),
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """
+    Proxy GET {ha_url}/api/hassio/addons. Returns the list of installed add-ons
+    plus any slugs that match the File Editor discovery heuristic used by the
+    deployment executor's file-write path.
+    """
+    row = await pool.fetchrow(
+        "SELECT ha_url, ha_token FROM a_sites WHERE site_id = $1", site_id
+    )
+    if not row or not row["ha_url"] or not row["ha_token"]:
+        raise HTTPException(status_code=400, detail="Site has no HA connection configured")
+
+    ha_url = row["ha_url"].rstrip("/")
+    ha_token = row["ha_token"]
+    headers = {"Authorization": f"Bearer {ha_token}"}
+
+    logger.info(f"[ha-addons] site={site_id} listing addons")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(f"{ha_url}/api/hassio/addons", headers=headers)
+        except Exception as e:
+            logger.warning(f"[ha-addons] fetch failed for site {site_id}: {e}")
+            raise HTTPException(status_code=502, detail=f"HA hassio fetch failed: {e}")
+
+    ok = 200 <= resp.status_code < 300
+    addons: list[HaAddonEntry] = []
+    candidates: list[str] = []
+    error: Optional[str] = None
+
+    if not ok:
+        error = resp.text[:500]
+        return HaAddonsResult(
+            site_id=site_id, status_code=resp.status_code, ok=False,
+            count=0, addons=[], file_editor_candidates=[], error=error,
+        )
+
+    try:
+        body = resp.json() or {}
+    except Exception as e:
+        return HaAddonsResult(
+            site_id=site_id, status_code=resp.status_code, ok=False,
+            count=0, addons=[], file_editor_candidates=[],
+            error=f"non-JSON response: {e}",
+        )
+
+    payload = body.get("data", body) if isinstance(body, dict) else {}
+    raw_addons = payload.get("addons", []) if isinstance(payload, dict) else []
+    if not isinstance(raw_addons, list):
+        raw_addons = []
+
+    for entry in raw_addons:
+        if not isinstance(entry, dict):
+            continue
+        addons.append(HaAddonEntry(
+            slug=entry.get("slug"),
+            name=entry.get("name"),
+            state=entry.get("state"),
+            version=entry.get("version"),
+            installed=entry.get("installed") or entry.get("version_installed"),
+            update_available=entry.get("update_available"),
+        ))
+
+    # Candidate slugs: known slugs first, then started add-ons with File-Editor-y names.
+    by_slug = {a.slug: a for a in addons if a.slug}
+    for slug in _FILE_EDITOR_SLUGS:
+        a = by_slug.get(slug)
+        if a and a.state == "started":
+            candidates.append(slug)
+    for a in addons:
+        if a.state != "started" or not a.slug or a.slug in candidates:
+            continue
+        name_lc = (a.name or "").lower()
+        if any(k in name_lc for k in _FILE_EDITOR_NAME_KEYWORDS):
+            candidates.append(a.slug)
+
+    return HaAddonsResult(
+        site_id=site_id,
+        status_code=resp.status_code,
+        ok=True,
+        count=len(addons),
+        addons=addons,
+        file_editor_candidates=candidates,
+    )
+
+
+# ------------------------------------------------------------------
 # HA entity state diagnostics
 # ------------------------------------------------------------------
 
